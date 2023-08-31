@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 // server编码解码相关代码，包括如下步骤
@@ -21,13 +22,16 @@ import (
 const MagicNumber int = 114514
 
 type Option struct {
-	MagicNumber int
-	CodecType   codec.Type
+	MagicNumber    int
+	CodecType      codec.Type
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   "GobCodec",
+	MagicNumber:    MagicNumber,
+	CodecType:      "GobCodec",
+	ConnectTimeout: 10 * time.Second,
 }
 
 type Server struct {
@@ -70,13 +74,13 @@ func (server *Server) ServerConn(conn io.ReadWriteCloser) {
 		log.Println("rpc server: codec func error!")
 		return
 	}
-	server.serverCodec(f(conn))
+	server.serverCodec(f(conn), option)
 }
 
 // invalidRequest 被返回，当错误发生的时候
 var invalidRequest = struct{}{}
 
-func (server *Server) serverCodec(cc codec.Codec) {
+func (server *Server) serverCodec(cc codec.Codec, opt Option) {
 	wg := &sync.WaitGroup{}
 	sending := &sync.Mutex{}
 	for {
@@ -90,7 +94,7 @@ func (server *Server) serverCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.ConnectTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -147,15 +151,36 @@ func (server *Server) sendResponse(cc codec.Codec, header *codec.Header, body in
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, mu *sync.Mutex, wg *sync.WaitGroup) {
+// handleRequest 服务端处理来自客户端的请求并返回调用后的结果
+func (server *Server) handleRequest(cc codec.Codec, req *request, mu *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.call(req.mtype, req.argv, req.reply)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(cc, req.h, invalidRequest, mu)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.reply)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(cc, req.h, invalidRequest, mu)
+			sent <- struct{}{}
+			return
+		}
+		server.sendResponse(cc, req.h, req.reply.Interface(), mu)
+		sent <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	server.sendResponse(cc, req.h, req.reply.Interface(), mu)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout!")
+		server.sendResponse(cc, req.h, invalidRequest, mu)
+	case <-called:
+		<-sent
+
+	}
 }
 
 // 关于服务注册的两个方法

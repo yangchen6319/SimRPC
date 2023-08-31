@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"github.com/yangchen6319/SimRPC/client"
 	"github.com/yangchen6319/SimRPC/service"
 	"log"
@@ -45,6 +46,8 @@ func main() {
 	time.Sleep(3 * time.Second)
 	// send request & receive response
 	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer func() { cancel() }()
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -54,7 +57,7 @@ func main() {
 				Num2: i * i,
 			}
 			var reply int
-			if err := cli.Call("Foo.Sum", args, &reply); err != nil {
+			if err := cli.Call(ctx, "Foo.Sum", args, &reply); err != nil {
 				log.Println(err)
 			}
 			log.Printf("%d + %d = %d:", args.Num1, args.Num2, reply)

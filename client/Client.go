@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type Call struct {
@@ -35,6 +37,13 @@ type Client struct {
 	shutdown bool
 	close    bool
 }
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *service.Option) (client *Client, err error)
 
 var ErrShutdown = errors.New("connection is shut down")
 
@@ -146,12 +155,13 @@ func parseOptions(opts ...*service.Option) (*service.Option, error) {
 	return opt, nil
 }
 
-func Dial(network, address string, opts ...*service.Option) (client *Client, err error) {
+// dialTimeout 添加了超时处理机制
+func dialTimeout(f newClientFunc, network, address string, opts ...*service.Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +170,29 @@ func Dial(network, address string, opts ...*service.Option) (client *Client, err
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+	cr := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		cr <- clientResult{
+			client: client,
+			err:    err,
+		}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-cr
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-cr:
+		return result.client, result.err
+	}
+
+}
+
+func Dial(network, address string, opts ...*service.Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 func (client *Client) send(call *Call) {
@@ -201,7 +233,14 @@ func (client *Client) GO(serviceMethod string, args, reply interface{}, done cha
 	return call
 }
 
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	call := <-client.GO(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Err
+// Call 实现客户端对于远程服务的调用
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	call := client.GO(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call timeout!")
+	case ca := <-call.Done:
+		return ca.Err
+	}
 }
